@@ -20,41 +20,41 @@ output "vm_public_ips" {
 }
 
 output "databricks_workspace_url" {
-  value = try(module.databricks.workspace_url, null)
+  value = try(module.databricks[0].workspace_url, null)
 }
 
 output "data_factory_name" {
-  value = try(module.datafactory.name, null)
+  value = try(module.datafactory[0].name, null)
 }
 
 output "storage_account_name" {
-  value = try(module.storage_account.name, null)
+  value = try(module.storage_account[0].name, null)
 }
 
 output "key_vault_name" {
-  value = try(module.key_vault.name, null)
+  value = try(module.key_vault[0].name, null)
 }
 
 output "log_analytics_workspace_id" {
-  value = try(module.log_analytics.id, null)
+  value = try(module.log_analytics[0].id, null)
 }
 
 output "application_insights_connection_string" {
-  value = try(module.app_insights.connection_string, null)
+  value = try(module.app_insights[0].connection_string, null)
 }
 
 output "acr_login_server" {
-  value = try(module.acr.login_server, null)
+  value = try(module.acr[0].login_server, null)
 }
 
 output "sql_server_fqdn" {
-  value = try(module.sql.server_fqdn, null)
+  value = try(module.sql[0].server_fqdn, null)
 }
 
 output "sql_database_id" {
-  value = try(module.sql.database_id, null)
+  value = try(module.sql[0].database_id, null)
 }
 
 output "bastion_name" {
-  value = try(module.bastion.name, null)
+  value = try(module.bastion[0].name, null)
 }

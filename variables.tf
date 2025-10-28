@@ -156,15 +156,13 @@ variable "sql" {
   description = "Azure SQL Server and one DB"
   type = object({
     enabled        = optional(bool, true)
-    version        = optional(string, "12.0")
+    server_version = optional(string, "12.0") # was 'version'
     admin_login    = optional(string, "sqladminuser")
     admin_password = optional(string, "")
     db_name        = optional(string, "appdb")
     db_sku_name    = optional(string, "Basic")
   })
-  default = {
-    enabled = false
-  }
+  default = { enabled = false }
 }
 
 variable "bastion" {

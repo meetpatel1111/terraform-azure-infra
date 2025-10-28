@@ -164,7 +164,7 @@ module "sql" {
   name                = local.names.sql
   resource_group_name = module.resource_group.name
   location            = var.location
-  version             = try(var.sql.version, "12.0")
+  server_version      = try(var.sql.server_version, "12.0")
   admin_login         = try(var.sql.admin_login, "sqladminuser")
   admin_password      = try(var.sql.admin_password, "")
   db_name             = try(var.sql.db_name, "appdb")

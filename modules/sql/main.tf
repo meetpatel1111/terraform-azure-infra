@@ -1,6 +1,6 @@
 resource "random_password" "sql" {
-  length  = 20
-  special = true
+  length              = 20
+  special             = true
 }
 
 locals {
@@ -11,7 +11,7 @@ resource "azurerm_mssql_server" "this" {
   name                         = var.name
   resource_group_name          = var.resource_group_name
   location                     = var.location
-  version                      = var.version
+  version                      = var.server_version
   administrator_login          = var.admin_login
   administrator_login_password = local.admin_password
   minimum_tls_version          = "1.2"
