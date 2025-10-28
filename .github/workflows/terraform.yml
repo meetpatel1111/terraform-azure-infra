@@ -37,14 +37,17 @@ on:
         required: false
         default: "1.7.5"
       backend_rg:
+        default: "tfstate-shared-rg"
         description: "Backend: Resource Group"
         type: string
         required: true
       backend_storage_account:
+        default: "sttfstateshared"
         description: "Backend: Storage Account"
         type: string
         required: true
       backend_container:
+        default: "tfstate"
         description: "Backend: Blob Container"
         type: string
         required: true
