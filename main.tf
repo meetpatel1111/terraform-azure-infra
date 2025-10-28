@@ -42,7 +42,7 @@ module "subnets" {
 # ------------
 locals {
   vm_subnet_id = module.subnets[var.vm.subnet_key].id
-  vm_prefix    = join(
+  vm_prefix = join(
     "-",
     compact([
       local.svc.vm,
