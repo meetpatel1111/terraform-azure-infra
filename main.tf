@@ -42,7 +42,16 @@ module "subnets" {
 # ------------
 locals {
   vm_subnet_id = module.subnets[var.vm.subnet_key].id
-  vm_prefix    = trim("${local.svc.vm}${var.vm.role_suffix != "" ? "-${var.vm.role_suffix}" : ""}-${var.environment_type}-${var.location_code}-${var.environment_name}")
+  vm_prefix    = join(
+    "-",
+    compact([
+      local.svc.vm,
+      var.vm.role_suffix != "" ? var.vm.role_suffix : null,
+      var.environment_type,
+      var.location_code,
+      var.environment_name
+    ])
+  )
 }
 
 module "vm" {
