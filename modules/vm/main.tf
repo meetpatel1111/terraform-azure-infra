@@ -1,16 +1,16 @@
 locals {
-  # Index sets for VMs and data disks
-  vm_indexes   = toset([for i in range(var.vm_count) : i])
-  disk_indexes = toset([for i in range(length(var.data_disk_sizes_gb)) : i])
+  # Use string keys for for_each (required: sets/maps of strings)
+  vm_indexes   = toset([for i in range(var.vm_count) : tostring(i)])
+  disk_indexes = toset([for i in range(length(var.data_disk_sizes_gb)) : tostring(i)])
 
-  # Build a map of vm x disk pairs for creating/attaching data disks
+  # Map of vm x disk pairs for creating & attaching data disks
   vm_disk_pairs = {
     for pair in flatten([
       for v in local.vm_indexes : [
         for d in local.disk_indexes : {
           key        = "${v}-${d}"
-          vm_index   = v
-          disk_index = d
+          vm_index   = v # string key
+          disk_index = d # string key
         }
       ]
     ]) : pair.key => pair
@@ -79,7 +79,7 @@ resource "azurerm_linux_virtual_machine" "this" {
   tags = var.tags
 }
 
-# Data disks (managed) — one per vm x disk_index
+# Data disks (managed) — one per (vm x disk_index)
 resource "azurerm_managed_disk" "data" {
   for_each             = local.vm_disk_pairs
   name                 = "${var.name_prefix}-${each.value.vm_index}-d${each.value.disk_index}"
@@ -87,7 +87,7 @@ resource "azurerm_managed_disk" "data" {
   resource_group_name  = var.resource_group_name
   storage_account_type = "Standard_LRS"
   create_option        = "Empty"
-  disk_size_gb         = var.data_disk_sizes_gb[each.value.disk_index]
+  disk_size_gb         = var.data_disk_sizes_gb[tonumber(each.value.disk_index)]
   tags                 = var.tags
 }
 
@@ -96,11 +96,11 @@ resource "azurerm_virtual_machine_data_disk_attachment" "attach" {
   for_each           = local.vm_disk_pairs
   managed_disk_id    = azurerm_managed_disk.data[each.key].id
   virtual_machine_id = azurerm_linux_virtual_machine.this[each.value.vm_index].id
-  lun                = each.value.disk_index
+  lun                = tonumber(each.value.disk_index)
   caching            = "ReadWrite"
 }
 
-# Outputs (module-level)
+# Module outputs
 output "names" {
   value = [for k in local.vm_indexes : azurerm_linux_virtual_machine.this[k].name]
 }
