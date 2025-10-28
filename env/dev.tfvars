@@ -96,7 +96,7 @@ container_registry = {
 
 sql = {
   enabled        = true
-  server_version = "12.0"     # was 'version'
+  server_version = "12.0" # was 'version'
   admin_login    = "sqladminuser"
   admin_password = "ChangeM3Now!" # replace securely
   db_name        = "appdb"

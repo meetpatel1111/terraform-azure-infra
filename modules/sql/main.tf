@@ -1,6 +1,6 @@
 resource "random_password" "sql" {
-  length              = 20
-  special             = true
+  length  = 20
+  special = true
 }
 
 locals {
