@@ -12,11 +12,11 @@ output "subnet_names" {
 }
 
 output "vm_names" {
-  value = module.vm.names
+  value = try(module.vm[0].names, [])
 }
 
 output "vm_public_ips" {
-  value = module.vm.public_ip_addresses
+  value = try(module.vm[0].public_ip_addresses, [])
 }
 
 output "databricks_workspace_url" {
