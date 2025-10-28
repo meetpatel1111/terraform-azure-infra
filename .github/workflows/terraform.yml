@@ -1,0 +1,167 @@
+name: Terraform Azure IaC
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (drives env/<environment>.tfvars)"
+        type: choice
+        required: true
+        options: [dev, uat, prod]
+        default: dev
+      tf_action:
+        description: "Terraform action"
+        type: choice
+        options: [plan, apply, destroy]
+        required: true
+        default: plan
+      environment_type:
+        description: "Env type code (np/p) for naming (locals.tf)"
+        type: choice
+        options: [np, p]
+        required: true
+        default: np
+      location:
+        description: "Azure region display name (e.g., 'UK South')"
+        type: string
+        required: true
+        default: "UK South"
+      location_code:
+        description: "Short region code used in names (e.g., 'uks')"
+        type: string
+        required: true
+        default: "uks"
+      tf_version:
+        description: "Terraform version"
+        type: string
+        required: false
+        default: "1.7.5"
+      backend_rg:
+        description: "Backend: Resource Group"
+        type: string
+        required: true
+      backend_storage_account:
+        description: "Backend: Storage Account"
+        type: string
+        required: true
+      backend_container:
+        description: "Backend: Blob Container"
+        type: string
+        required: true
+      backend_key_prefix:
+        description: "Backend: key prefix (file path prefix for state), e.g., 'iac/core'"
+        type: string
+        required: false
+        default: "iac/core"
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.tf_action }} (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+
+    # This ties into GitHub "Environments" for approvals & secrets scoping.
+    environment: ${{ inputs.environment }}
+
+    # Provide ARM_* envs for Terraform Azurerm provider. Keep these secrets in repo/org ENV.
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      # Pass dynamic variables (these override values in tfvars if you reference var.* directly)
+      TF_VAR_environment_type: ${{ inputs.environment_type }}
+      TF_VAR_environment_name: ${{ inputs.environment }}
+      TF_VAR_location: ${{ inputs.location }}
+      TF_VAR_location_code: ${{ inputs.location_code }}
+
+      # Backend inputs
+      BACKEND_RG: ${{ inputs.backend_rg }}
+      BACKEND_SA: ${{ inputs.backend_storage_account }}
+      BACKEND_CONTAINER: ${{ inputs.backend_container }}
+      BACKEND_KEY: ${{ inputs.backend_key_prefix }}/${{ inputs.environment }}.tfstate
+
+      # Common
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Terraform version
+        id: tfver
+        run: echo "TF_VERSION=${{ inputs.tf_version }}" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Azure Login (OIDC or secret-based)
+        # If you use OIDC, configure Federated Credentials in Entra ID and
+        # replace 'creds' with clientId/tenantId/subscriptionId inputs instead.
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_JSON }}
+          # OR (OIDC):
+          # client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          # tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          # subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Display Azure context
+        run: |
+          az account show
+          echo "Using backend key: ${BACKEND_KEY}"
+
+      - name: Select tfvars file
+        id: tfvars
+        run: |
+          FILE="env/${{ inputs.environment }}.tfvars"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found" >&2
+            exit 1
+          fi
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+
+      - name: Terraform Init (remote backend)
+        working-directory: .
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${BACKEND_RG}" \
+            -backend-config="storage_account_name=${BACKEND_SA}" \
+            -backend-config="container_name=${BACKEND_CONTAINER}" \
+            -backend-config="key=${BACKEND_KEY}"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        if: ${{ inputs.tf_action == 'plan' || inputs.tf_action == 'apply' }}
+        run: |
+          terraform plan \
+            -var-file="${{ steps.tfvars.outputs.file }}" \
+            -out="tfplan-${{ inputs.environment }}.bin"
+        continue-on-error: false
+
+      - name: Upload Plan Artifact
+        if: ${{ inputs.tf_action == 'plan' || inputs.tf_action == 'apply' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ inputs.environment }}
+          path: tfplan-${{ inputs.environment }}.bin
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Terraform Apply (requires environment approval)
+        if: ${{ inputs.tf_action == 'apply' }}
+        run: |
+          terraform apply -auto-approve "tfplan-${{ inputs.environment }}.bin"
+
+      - name: Terraform Destroy (requires environment approval)
+        if: ${{ inputs.tf_action == 'destroy' }}
+        run: |
+          # note: you can also pass -var-file here to ensure full parity with the plan
+          terraform destroy -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
