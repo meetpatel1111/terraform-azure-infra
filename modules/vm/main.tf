@@ -1,23 +1,7 @@
 locals {
-  # Use string keys for for_each (required: sets/maps of strings)
-  vm_indexes   = toset([for i in range(var.vm_count) : tostring(i)])
-  disk_indexes = toset([for i in range(length(var.data_disk_sizes_gb)) : tostring(i)])
-
-  # Map of vm x disk pairs for creating & attaching data disks
-  vm_disk_pairs = {
-    for pair in flatten([
-      for v in local.vm_indexes : [
-        for d in local.disk_indexes : {
-          key        = "${v}-${d}"
-          vm_index   = v # string key
-          disk_index = d # string key
-        }
-      ]
-    ]) : pair.key => pair
-  }
+  vm_indexes = toset([for i in range(var.vm_count) : i])
 }
 
-# Optional public IPs (one per VM)
 resource "azurerm_public_ip" "this" {
   for_each            = var.public_ip ? local.vm_indexes : toset([])
   name                = "${var.name_prefix}-${each.key}-pip"
@@ -28,7 +12,6 @@ resource "azurerm_public_ip" "this" {
   tags                = var.tags
 }
 
-# NICs (one per VM)
 resource "azurerm_network_interface" "this" {
   for_each            = local.vm_indexes
   name                = "${var.name_prefix}-${each.key}-nic"
@@ -45,7 +28,6 @@ resource "azurerm_network_interface" "this" {
   tags = var.tags
 }
 
-# Linux VMs (one per index)
 resource "azurerm_linux_virtual_machine" "this" {
   for_each              = local.vm_indexes
   name                  = "${var.name_prefix}-${each.key}"
@@ -68,7 +50,17 @@ resource "azurerm_linux_virtual_machine" "this" {
     storage_account_type = "Standard_LRS"
   }
 
-  # Ubuntu 22.04 LTS (Gen2)
+  dynamic "data_disk" {
+    for_each = var.data_disk_sizes_gb
+
+    content {
+      caching              = "ReadWrite"
+      disk_size_gb         = data_disk.value
+      lun                  = index(var.data_disk_sizes_gb, data_disk.value)
+      storage_account_type = "Standard_LRS"
+    }
+  }
+
   source_image_reference {
     publisher = "Canonical"
     offer     = "0001-com-ubuntu-server-jammy"
@@ -79,28 +71,6 @@ resource "azurerm_linux_virtual_machine" "this" {
   tags = var.tags
 }
 
-# Data disks (managed) — one per (vm x disk_index)
-resource "azurerm_managed_disk" "data" {
-  for_each             = local.vm_disk_pairs
-  name                 = "${var.name_prefix}-${each.value.vm_index}-d${each.value.disk_index}"
-  location             = var.location
-  resource_group_name  = var.resource_group_name
-  storage_account_type = "Standard_LRS"
-  create_option        = "Empty"
-  disk_size_gb         = var.data_disk_sizes_gb[tonumber(each.value.disk_index)]
-  tags                 = var.tags
-}
-
-# Attach data disks to VMs
-resource "azurerm_virtual_machine_data_disk_attachment" "attach" {
-  for_each           = local.vm_disk_pairs
-  managed_disk_id    = azurerm_managed_disk.data[each.key].id
-  virtual_machine_id = azurerm_linux_virtual_machine.this[each.value.vm_index].id
-  lun                = tonumber(each.value.disk_index)
-  caching            = "ReadWrite"
-}
-
-# Module outputs
 output "names" {
   value = [for k in local.vm_indexes : azurerm_linux_virtual_machine.this[k].name]
 }

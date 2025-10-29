@@ -23,3 +23,15 @@ variable "tags" {
   default = {
   }
 }
+
+variable "access_policies" {
+  description = "List of access policies to assign to Key Vault"
+  type = list(object({
+    object_id               = string
+    key_permissions         = optional(list(string), [])
+    secret_permissions      = optional(list(string), [])
+    certificate_permissions = optional(list(string), [])
+    storage_permissions     = optional(list(string), [])
+  }))
+  default = []
+}

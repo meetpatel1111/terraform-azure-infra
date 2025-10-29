@@ -12,11 +12,11 @@ output "subnet_names" {
 }
 
 output "vm_names" {
-  value = try(module.vm[0].names, [])
+  value = module.vm.names
 }
 
 output "vm_public_ips" {
-  value = try(module.vm[0].public_ip_addresses, [])
+  value = module.vm.public_ip_addresses
 }
 
 output "databricks_workspace_url" {
@@ -57,4 +57,12 @@ output "sql_database_id" {
 
 output "bastion_name" {
   value = try(module.bastion[0].name, null)
+}
+
+output "vm_ssh_private_key_secret_id" {
+  value = try(azurerm_key_vault_secret.vm_private_key[0].id, null)
+}
+
+output "vm_ssh_public_key_secret_id" {
+  value = try(azurerm_key_vault_secret.vm_public_key[0].id, null)
 }

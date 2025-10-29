@@ -42,16 +42,7 @@ module "subnets" {
 # ------------
 locals {
   vm_subnet_id = module.subnets[var.vm.subnet_key].id
-  vm_prefix = join(
-    "-",
-    compact([
-      local.svc.vm,
-      var.vm.role_suffix != "" ? var.vm.role_suffix : null,
-      var.environment_type,
-      var.location_code,
-      var.environment_name
-    ])
-  )
+  vm_prefix    = trim("${local.svc.vm}${var.vm.role_suffix != "" ? "-${var.vm.role_suffix}" : ""}-${var.environment_type}-${var.location_code}-${var.environment_name}")
 }
 
 module "vm" {
@@ -61,7 +52,7 @@ module "vm" {
   vm_count            = var.vm.count
   size                = var.vm.size
   admin_username      = var.vm.admin_username
-  ssh_public_key      = var.vm.ssh_public_key
+  ssh_public_key      = tls_private_key.vm.public_key_openssh
   subnet_id           = local.vm_subnet_id
   public_ip           = try(var.vm.public_ip, true)
   data_disk_sizes_gb  = try(var.vm.data_disk_sizes_gb, [])
@@ -123,8 +114,18 @@ module "key_vault" {
   location                      = var.location
   sku_name                      = try(var.key_vault.sku_name, "standard")
   public_network_access_enabled = try(var.key_vault.public_network_access_enabled, true)
-  tenant_id                     = "00000000-0000-0000-0000-000000000000" # TODO: replace
+  tenant_id                     = data.azurerm_client_config.current.tenant_id
   tags                          = var.tags
+
+  access_policies = [
+    {
+      object_id               = data.azurerm_client_config.current.object_id
+      secret_permissions      = ["Get", "List", "Set", "Delete", "Purge", "Recover", "Backup", "Restore"]
+      key_permissions         = []
+      certificate_permissions = []
+      storage_permissions     = []
+    }
+  ]
 }
 
 # ----------------------
@@ -195,4 +196,28 @@ module "bastion" {
   sku                   = try(var.bastion.sku, "Basic")
   scale_units           = try(var.bastion.scale_units, 2)
   tags                  = var.tags
+}
+
+# Auto-generated SSH keypair for VMs
+resource "tls_private_key" "vm" {
+  algorithm = "ED25519"
+}
+
+# Store generated keys in Key Vault (only when KV + VM are enabled)
+resource "azurerm_key_vault_secret" "vm_private_key" {
+  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-private-key"
+  value        = tls_private_key.vm.private_key_pem
+  content_type = "application/x-pem-file"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [module.key_vault]
+}
+
+resource "azurerm_key_vault_secret" "vm_public_key" {
+  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-public-key"
+  value        = tls_private_key.vm.public_key_openssh
+  content_type = "text/plain"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [module.key_vault]
 }
