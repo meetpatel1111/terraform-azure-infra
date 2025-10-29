@@ -80,13 +80,13 @@ jobs:
       BACKEND_KEY: ${{ inputs.backend_key_prefix }}/${{ inputs.environment }}.tfstate
 
       TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set Terraform version
-        id: tfver
         run: echo "TF_VERSION=${{ inputs.tf_version }}" >> $GITHUB_ENV
 
       - name: Setup Terraform
@@ -112,9 +112,6 @@ jobs:
       - name: Ensure backend state storage exists (RG/SA/Container)
         env:
           LOCATION: ${{ inputs.location }}
-          BACKEND_RG: ${{ inputs.backend_rg }}
-          BACKEND_SA: ${{ inputs.backend_storage_account }}
-          BACKEND_CONTAINER: ${{ inputs.backend_container }}
         run: |
           set -euo pipefail
           echo "Ensuring resource group '${BACKEND_RG}' in '${LOCATION}'..."
@@ -160,6 +157,27 @@ jobs:
 
           echo "✅ Backend ready."
 
+      # Optional but recommended: grant data-plane RBAC for blob uploads via AAD
+      - name: Ensure RBAC for blob upload (Storage Blob Data Contributor)
+        run: |
+          set -euo pipefail
+          SCOPE_ID=$(az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" --query id -o tsv)
+          echo "Assigning 'Storage Blob Data Contributor' to principalId ${ARM_CLIENT_ID} on ${SCOPE_ID} (idempotent)..."
+          az role assignment create \
+            --assignee-object-id "${ARM_CLIENT_ID}" \
+            --assignee-principal-type ServicePrincipal \
+            --role "Storage Blob Data Contributor" \
+            --scope "${SCOPE_ID}" >/dev/null || true
+
+          echo "Waiting for RBAC propagation..."
+          for i in {1..12}; do
+            if az storage container list --account-name "${BACKEND_SA}" --auth-mode login >/dev/null 2>&1; then
+              echo "RBAC ready."
+              break
+            fi
+            sleep 10
+          done
+
       - name: Select tfvars file
         id: tfvars
         run: |
@@ -184,29 +202,27 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
-      # ---------- Standard Plan / Apply / Destroy ----------
-      - name: Terraform Plan
+      # ---------- Standard Plan / Apply / Destroy (no .bin) ----------
+      - name: Terraform Plan (text)
         if: ${{ inputs.tf_action == 'plan' || inputs.tf_action == 'apply' }}
         run: |
-          terraform plan \
-            -var-file="${{ steps.tfvars.outputs.file }}" \
-            -out="tfplan-${{ inputs.environment }}.bin"
+          terraform plan -no-color -var-file="${{ steps.tfvars.outputs.file }}" | tee plan-${{ inputs.environment }}.txt
 
-      - name: Upload Plan Artifact
+      - name: Upload Plan (text)
         if: ${{ inputs.tf_action == 'plan' || inputs.tf_action == 'apply' }}
         uses: actions/upload-artifact@v4
         with:
           name: plan-${{ inputs.environment }}
-          path: tfplan-${{ inputs.environment }}.bin
+          path: plan-${{ inputs.environment }}.txt
           if-no-files-found: error
           retention-days: 7
 
-      - name: Terraform Apply (requires environment approval)
+      - name: Terraform Apply (direct, no saved plan)
         if: ${{ inputs.tf_action == 'apply' }}
-        run: terraform apply -auto-approve "tfplan-${{ inputs.environment }}.bin"
+        run: terraform apply -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
 
-      # Snapshot & upload state after normal apply
-      - name: Snapshot and upload state (apply)
+      # Ensure backend state blob exists after apply (create if missing), and snapshot
+      - name: Ensure backend tfstate exists + snapshot (apply)
         if: ${{ inputs.tf_action == 'apply' }}
         env:
           BACKEND_SA: ${{ env.BACKEND_SA }}
@@ -214,11 +230,34 @@ jobs:
           BACKEND_KEY: ${{ env.BACKEND_KEY }}
         run: |
           set -euo pipefail
+
+          # If backend tfstate blob is missing, create it from current state
+          EXISTS=$(az storage blob exists \
+            --account-name "${BACKEND_SA}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${BACKEND_KEY}" \
+            --auth-mode login --query exists -o tsv)
+          if [ "${EXISTS}" != "true" ]; then
+            echo "Backend state blob not found. Creating it from current Terraform state..."
+            terraform state pull > state.tfstate
+            az storage blob upload \
+              --account-name "${BACKEND_SA}" \
+              --container-name "${BACKEND_CONTAINER}" \
+              --name "${BACKEND_KEY}" \
+              --file state.tfstate \
+              --auth-mode login \
+              --overwrite true >/dev/null
+            echo "Backend state blob created: ${BACKEND_KEY}"
+          else
+            echo "Backend state blob exists."
+          fi
+
+          # Always upload a timestamped snapshot
           TS=$(date -u +"%Y%m%dT%H%M%SZ")
           BASE_DIR=$(dirname "${BACKEND_KEY}")
           BASE_FILE=$(basename "${BACKEND_KEY}" .tfstate)
           SNAP_BLOB="${BASE_DIR}/${BASE_FILE}/snapshots/${TS}-${GITHUB_RUN_ID}.tfstate"
-          echo "Pulling current state and uploading to '${SNAP_BLOB}'..."
+          echo "Snapshotting current state to '${SNAP_BLOB}'..."
           terraform state pull > state.tfstate
           az storage blob upload \
             --account-name "${BACKEND_SA}" \
@@ -227,37 +266,33 @@ jobs:
             --file state.tfstate \
             --auth-mode login \
             --overwrite true >/dev/null
-          echo "Uploaded snapshot: ${SNAP_BLOB}"
+          echo "Snapshot uploaded."
 
-      - name: Terraform Destroy (requires environment approval)
+      - name: Terraform Destroy (direct)
         if: ${{ inputs.tf_action == 'destroy' }}
         run: terraform destroy -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
 
-      # ---------- Refresh-only (plan) ----------
-      - name: Terraform Plan (refresh-only)
+      # ---------- Refresh-only (no .bin) ----------
+      - name: Terraform Plan (refresh-only, text)
         if: ${{ inputs.tf_action == 'refresh' || inputs.tf_action == 'refresh-apply' }}
         run: |
-          terraform plan \
-            -refresh-only \
-            -var-file="${{ steps.tfvars.outputs.file }}" \
-            -out="tfplan-refresh-${{ inputs.environment }}.bin"
+          terraform plan -refresh-only -no-color -var-file="${{ steps.tfvars.outputs.file }}" | tee plan-refresh-${{ inputs.environment }}.txt
 
-      - name: Upload Refresh Plan Artifact
+      - name: Upload Refresh Plan (text)
         if: ${{ inputs.tf_action == 'refresh' || inputs.tf_action == 'refresh-apply' }}
         uses: actions/upload-artifact@v4
         with:
           name: plan-refresh-${{ inputs.environment }}
-          path: tfplan-refresh-${{ inputs.environment }}.bin
+          path: plan-refresh-${{ inputs.environment }}.txt
           if-no-files-found: error
           retention-days: 7
 
-      # Apply the refresh-only plan (updates state to match real world; no infra changes)
-      - name: Terraform Apply (refresh-only)
+      - name: Terraform Apply (refresh-only, direct)
         if: ${{ inputs.tf_action == 'refresh-apply' }}
-        run: terraform apply -auto-approve "tfplan-refresh-${{ inputs.environment }}.bin"
+        run: terraform apply -refresh-only -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
 
-      # Snapshot & upload state after refresh-apply
-      - name: Snapshot and upload state (refresh-apply)
+      # Ensure backend state exists after refresh-apply (create if missing), and snapshot
+      - name: Ensure backend tfstate exists + snapshot (refresh-apply)
         if: ${{ inputs.tf_action == 'refresh-apply' }}
         env:
           BACKEND_SA: ${{ env.BACKEND_SA }}
@@ -265,11 +300,34 @@ jobs:
           BACKEND_KEY: ${{ env.BACKEND_KEY }}
         run: |
           set -euo pipefail
+
+          # If backend tfstate blob is missing, create it from current state
+          EXISTS=$(az storage blob exists \
+            --account-name "${BACKEND_SA}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${BACKEND_KEY}" \
+            --auth-mode login --query exists -o tsv)
+          if [ "${EXISTS}" != "true" ]; then
+            echo "Backend state blob not found. Creating it from current Terraform state..."
+            terraform state pull > state.tfstate
+            az storage blob upload \
+              --account-name "${BACKEND_SA}" \
+              --container-name "${BACKEND_CONTAINER}" \
+              --name "${BACKEND_KEY}" \
+              --file state.tfstate \
+              --auth-mode login \
+              --overwrite true >/dev/null
+            echo "Backend state blob created: ${BACKEND_KEY}"
+          else
+            echo "Backend state blob exists."
+          fi
+
+          # Always upload a timestamped snapshot
           TS=$(date -u +"%Y%m%dT%H%M%SZ")
           BASE_DIR=$(dirname "${BACKEND_KEY}")
           BASE_FILE=$(basename "${BACKEND_KEY}" .tfstate)
           SNAP_BLOB="${BASE_DIR}/${BASE_FILE}/snapshots/${TS}-${GITHUB_RUN_ID}.tfstate"
-          echo "Pulling refreshed state and uploading to '${SNAP_BLOB}'..."
+          echo "Snapshotting refreshed state to '${SNAP_BLOB}'..."
           terraform state pull > state.tfstate
           az storage blob upload \
             --account-name "${BACKEND_SA}" \
@@ -278,4 +336,4 @@ jobs:
             --file state.tfstate \
             --auth-mode login \
             --overwrite true >/dev/null
-          echo "Uploaded snapshot: ${SNAP_BLOB}"
+          echo "Snapshot uploaded."
