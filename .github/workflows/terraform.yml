@@ -12,7 +12,8 @@ on:
       tf_action:
         description: "Terraform action"
         type: choice
-        options: [plan, apply, destroy]
+        # Added refresh + refresh-apply
+        options: [plan, apply, destroy, refresh, refresh-apply]
         required: true
         default: plan
       environment_type:
@@ -108,7 +109,7 @@ jobs:
           az account show
           echo "Using backend key: ${BACKEND_KEY}"
 
-      # ✅ New Step: Automatically create backend RG, Storage Account, Container if missing
+      # Ensure remote backend exists
       - name: Ensure backend state storage exists (RG/SA/Container)
         env:
           LOCATION: ${{ inputs.location }}
@@ -117,47 +118,19 @@ jobs:
           BACKEND_CONTAINER: ${{ inputs.backend_container }}
         run: |
           set -euo pipefail
-
-          echo "Ensuring resource group '${BACKEND_RG}' (${LOCATION})..."
           az group create -n "${BACKEND_RG}" -l "${LOCATION}" >/dev/null
-
-          echo "Checking storage account '${BACKEND_SA}'..."
           if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
-            echo "Creating storage account '${BACKEND_SA}'..."
-            az storage account create \
-              -n "${BACKEND_SA}" \
-              -g "${BACKEND_RG}" \
-              -l "${LOCATION}" \
-              --sku Standard_LRS \
-              --kind StorageV2 \
-              --allow-blob-public-access false \
-              --min-tls-version TLS1_2 >/dev/null
-          else
-            echo "Storage account exists."
+            az storage account create -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${LOCATION}" \
+              --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
           fi
-
-          echo "Enabling blob protections (versioning, soft delete)..."
-          az storage account blob-service-properties update \
-            -n "${BACKEND_SA}" -g "${BACKEND_RG}" \
-            --enable-versioning true \
-            --change-feed-enabled true \
+          az storage account blob-service-properties update -n "${BACKEND_SA}" -g "${BACKEND_RG}" \
+            --enable-versioning true --change-feed-enabled true \
             --delete-retention true --delete-retention-days 7 \
             --container-delete-retention true --container-delete-retention-days 7 >/dev/null
-
-          echo "Ensuring container '${BACKEND_CONTAINER}'..."
-          if ! az storage container show \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --auth-mode login >/dev/null 2>&1; then
-            az storage container create \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --auth-mode login >/dev/null
-          else
-            echo "Container exists."
+          if ! az storage container show --name "${BACKEND_CONTAINER}" --account-name "${BACKEND_SA}" --auth-mode login >/dev/null 2>&1; then
+            az storage container create --name "${BACKEND_CONTAINER}" --account-name "${BACKEND_SA}" --auth-mode login >/dev/null
           fi
-
-          echo "✅ Backend ready"
+          echo "Backend ready."
 
       - name: Select tfvars file
         id: tfvars
@@ -183,6 +156,7 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
+      # ---------- Standard Plan / Apply / Destroy ----------
       - name: Terraform Plan
         if: ${{ inputs.tf_action == 'plan' || inputs.tf_action == 'apply' }}
         run: |
@@ -206,3 +180,26 @@ jobs:
       - name: Terraform Destroy (requires environment approval)
         if: ${{ inputs.tf_action == 'destroy' }}
         run: terraform destroy -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
+
+      # ---------- Refresh-only (plan) ----------
+      - name: Terraform Plan (refresh-only)
+        if: ${{ inputs.tf_action == 'refresh' || inputs.tf_action == 'refresh-apply' }}
+        run: |
+          terraform plan \
+            -refresh-only \
+            -var-file="${{ steps.tfvars.outputs.file }}" \
+            -out="tfplan-refresh-${{ inputs.environment }}.bin"
+
+      - name: Upload Refresh Plan Artifact
+        if: ${{ inputs.tf_action == 'refresh' || inputs.tf_action == 'refresh-apply' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-refresh-${{ inputs.environment }}
+          path: tfplan-refresh-${{ inputs.environment }}.bin
+          if-no-files-found: error
+          retention-days: 7
+
+      # Apply the refresh-only plan (updates state to match real world; no infra changes)
+      - name: Terraform Apply (refresh-only)
+        if: ${{ inputs.tf_action == 'refresh-apply' }}
+        run: terraform apply -auto-approve "tfplan-refresh-${{ inputs.environment }}.bin"
