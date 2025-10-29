@@ -56,17 +56,16 @@ on:
         type: string
         required: false
         default: "iac/core"
-      backend_key_override:
-        description: "Optional full backend key to the real state (e.g., aks/dev.tfstate)"
-        type: string
-        required: false
-        default: ""
 
 jobs:
   terraform:
     name: Terraform ${{ inputs.tf_action }} (${{ inputs.environment }})
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
 
     env:
       ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
@@ -82,6 +81,7 @@ jobs:
       BACKEND_RG:        ${{ inputs.backend_rg }}
       BACKEND_SA:        ${{ inputs.backend_storage_account }}
       BACKEND_CONTAINER: ${{ inputs.backend_container }}
+      # Backend state blob will be <prefix>/<env>.tfstate, e.g., iac/core/dev.tfstate
       BACKEND_KEY:       ${{ inputs.backend_key_prefix }}/${{ inputs.environment }}.tfstate
 
       TF_IN_AUTOMATION: "true"
@@ -104,22 +104,10 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS_JSON }}
 
-      # Decide the exact backend key (override if provided)
-      - name: Compute effective backend key
-        id: bk
-        run: |
-          set -euo pipefail
-          if [ -n "${{ inputs.backend_key_override }}" ]; then
-            echo "EFFECTIVE_BACKEND_KEY=${{ inputs.backend_key_override }}" >> $GITHUB_ENV
-          else
-            echo "EFFECTIVE_BACKEND_KEY=${BACKEND_KEY}" >> $GITHUB_ENV
-          fi
-          echo "Using backend key: ${EFFECTIVE_BACKEND_KEY}"
-
       - name: Display Azure context
         run: |
           az account show
-          echo "Backend key: ${EFFECTIVE_BACKEND_KEY}"
+          echo "Backend key: ${BACKEND_KEY}"
 
       # Ensure backend and grab the storage account key for all data-plane ops
       - name: Ensure Backend (RG/SA/Container) using account key
@@ -142,6 +130,7 @@ jobs:
             --enable-delete-retention true --delete-retention-days 7 \
             --enable-container-delete-retention true --container-delete-retention-days 7 >/dev/null
 
+          # Get account key for data-plane ops (avoids needing Blob Data RBAC)
           STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
           echo "storage_key=${STORAGE_KEY}" >> "$GITHUB_OUTPUT"
 
@@ -169,7 +158,7 @@ jobs:
             -backend-config="resource_group_name=${BACKEND_RG}" \
             -backend-config="storage_account_name=${BACKEND_SA}" \
             -backend-config="container_name=${BACKEND_CONTAINER}" \
-            -backend-config="key=${EFFECTIVE_BACKEND_KEY}"
+            -backend-config="key=${BACKEND_KEY}"
 
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
@@ -177,12 +166,12 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
-      # ---------- Show current state (always useful) ----------
+      # ---------- Show current state (helps catch empty/incorrect state) ----------
       - name: Show backend state content (resource list)
         run: |
           set -euo pipefail
           terraform state pull > current.tfstate || true
-          echo "State blob key: ${EFFECTIVE_BACKEND_KEY}"
+          echo "State blob key: ${BACKEND_KEY}"
           echo "Resource list:"
           terraform state list || echo "(state empty)"
 
@@ -222,19 +211,19 @@ jobs:
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
             --container-name "${BACKEND_CONTAINER}" \
-            --name "${EFFECTIVE_BACKEND_KEY}" --query exists -o tsv)
+            --name "${BACKEND_KEY}" --query exists -o tsv)
           if [ "${EXISTS}" != "true" ]; then
             terraform state pull > "${{ inputs.environment }}.tfstate"
             az storage blob upload \
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" \
               --container-name "${BACKEND_CONTAINER}" \
-              --name "${EFFECTIVE_BACKEND_KEY}" \
+              --name "${BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${EFFECTIVE_BACKEND_KEY}"
+            echo "Created backend state: ${BACKEND_KEY}"
           else
-            echo "Backend state exists: ${EFFECTIVE_BACKEND_KEY}"
+            echo "Backend state exists: ${BACKEND_KEY}"
           fi
 
       # ---------- DESTROY ----------
@@ -246,8 +235,8 @@ jobs:
           COUNT=$(jq '.resources | length' current.tfstate 2>/dev/null || echo 0)
           echo "Resource count in state: $COUNT"
           if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: Backend state is empty. Check EFFECTIVE_BACKEND_KEY and workspace."
-            echo "Current backend key: ${EFFECTIVE_BACKEND_KEY}"
+            echo "ERROR: Backend state is empty. Check BACKEND_KEY and workspace."
+            echo "Current backend key: ${BACKEND_KEY}"
             exit 1
           fi
 
@@ -277,17 +266,17 @@ jobs:
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
             --container-name "${BACKEND_CONTAINER}" \
-            --name "${EFFECTIVE_BACKEND_KEY}" --query exists -o tsv)
+            --name "${BACKEND_KEY}" --query exists -o tsv)
           if [ "${EXISTS}" != "true" ]; then
             terraform state pull > "${{ inputs.environment }}.tfstate"
             az storage blob upload \
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" \
               --container-name "${BACKEND_CONTAINER}" \
-              --name "${EFFECTIVE_BACKEND_KEY}" \
+              --name "${BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${EFFECTIVE_BACKEND_KEY}"
+            echo "Created backend state: ${BACKEND_KEY}"
           else
-            echo "Backend state exists: ${EFFECTIVE_BACKEND_KEY}"
+            echo "Backend state exists: ${BACKEND_KEY}"
           fi
