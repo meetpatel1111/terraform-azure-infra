@@ -56,6 +56,11 @@ on:
         type: string
         required: false
         default: "iac/core"
+      backend_key_override:
+        description: "Optional full backend key to the real state (e.g., aks/dev.tfstate)"
+        type: string
+        required: false
+        default: ""
 
 jobs:
   terraform:
@@ -77,7 +82,6 @@ jobs:
       BACKEND_RG:        ${{ inputs.backend_rg }}
       BACKEND_SA:        ${{ inputs.backend_storage_account }}
       BACKEND_CONTAINER: ${{ inputs.backend_container }}
-      # Backend state blob will be <prefix>/<env>.tfstate, e.g., iac/core/dev.tfstate
       BACKEND_KEY:       ${{ inputs.backend_key_prefix }}/${{ inputs.environment }}.tfstate
 
       TF_IN_AUTOMATION: "true"
@@ -100,10 +104,22 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS_JSON }}
 
+      # Decide the exact backend key (override if provided)
+      - name: Compute effective backend key
+        id: bk
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.backend_key_override }}" ]; then
+            echo "EFFECTIVE_BACKEND_KEY=${{ inputs.backend_key_override }}" >> $GITHUB_ENV
+          else
+            echo "EFFECTIVE_BACKEND_KEY=${BACKEND_KEY}" >> $GITHUB_ENV
+          fi
+          echo "Using backend key: ${EFFECTIVE_BACKEND_KEY}"
+
       - name: Display Azure context
         run: |
           az account show
-          echo "Backend key: ${BACKEND_KEY}"
+          echo "Backend key: ${EFFECTIVE_BACKEND_KEY}"
 
       # Ensure backend and grab the storage account key for all data-plane ops
       - name: Ensure Backend (RG/SA/Container) using account key
@@ -126,7 +142,6 @@ jobs:
             --enable-delete-retention true --delete-retention-days 7 \
             --enable-container-delete-retention true --container-delete-retention-days 7 >/dev/null
 
-          # 🔑 get account key for data-plane ops (no RBAC needed)
           STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
           echo "storage_key=${STORAGE_KEY}" >> "$GITHUB_OUTPUT"
 
@@ -139,7 +154,6 @@ jobs:
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" >/dev/null
           fi
-
           echo "✅ Backend ready."
 
       - name: Select tfvars
@@ -151,17 +165,26 @@ jobs:
 
       - name: Terraform Init (remote backend)
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -backend-config="resource_group_name=${BACKEND_RG}" \
             -backend-config="storage_account_name=${BACKEND_SA}" \
             -backend-config="container_name=${BACKEND_CONTAINER}" \
-            -backend-config="key=${BACKEND_KEY}"
+            -backend-config="key=${EFFECTIVE_BACKEND_KEY}"
 
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
 
       - name: Terraform Validate
         run: terraform validate
+
+      # ---------- Show current state (always useful) ----------
+      - name: Show backend state content (resource list)
+        run: |
+          set -euo pipefail
+          terraform state pull > current.tfstate || true
+          echo "State blob key: ${EFFECTIVE_BACKEND_KEY}"
+          echo "Resource list:"
+          terraform state list || echo "(state empty)"
 
       # ---------- PLAN ----------
       - name: Terraform Plan (writes <env>.tfplan)
@@ -189,7 +212,6 @@ jobs:
           terraform plan -input=false -var-file="$TFVARS_FILE" -out="${{ inputs.environment }}.tfplan"
           terraform apply -input=false -auto-approve "${{ inputs.environment }}.tfplan"
 
-      # Ensure backend <env>.tfstate exists after apply (upload if missing)
       - name: Ensure backend <env>.tfstate exists (post-apply)
         if: ${{ inputs.tf_action == 'apply' }}
         env:
@@ -200,22 +222,35 @@ jobs:
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
             --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}" --query exists -o tsv)
+            --name "${EFFECTIVE_BACKEND_KEY}" --query exists -o tsv)
           if [ "${EXISTS}" != "true" ]; then
             terraform state pull > "${{ inputs.environment }}.tfstate"
             az storage blob upload \
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" \
               --container-name "${BACKEND_CONTAINER}" \
-              --name "${BACKEND_KEY}" \
+              --name "${EFFECTIVE_BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${BACKEND_KEY}"
+            echo "Created backend state: ${EFFECTIVE_BACKEND_KEY}"
           else
-            echo "Backend state exists: ${BACKEND_KEY}"
+            echo "Backend state exists: ${EFFECTIVE_BACKEND_KEY}"
           fi
 
       # ---------- DESTROY ----------
+      - name: Guard: state must not be empty before destroy
+        if: ${{ inputs.tf_action == 'destroy' }}
+        run: |
+          set -euo pipefail
+          terraform state pull > current.tfstate || true
+          COUNT=$(jq '.resources | length' current.tfstate 2>/dev/null || echo 0)
+          echo "Resource count in state: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: Backend state is empty. Check EFFECTIVE_BACKEND_KEY and workspace."
+            echo "Current backend key: ${EFFECTIVE_BACKEND_KEY}"
+            exit 1
+          fi
+
       - name: Terraform Destroy (plan-destroy → apply)
         if: ${{ inputs.tf_action == 'destroy' }}
         run: |
@@ -232,7 +267,6 @@ jobs:
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
           terraform refresh -input=false -var-file="$TFVARS_FILE"
 
-      # Ensure backend <env>.tfstate exists after refresh (upload if missing)
       - name: Ensure backend <env>.tfstate exists (post-refresh)
         if: ${{ inputs.tf_action == 'refresh' }}
         env:
@@ -243,17 +277,17 @@ jobs:
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
             --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}" --query exists -o tsv)
+            --name "${EFFECTIVE_BACKEND_KEY}" --query exists -o tsv)
           if [ "${EXISTS}" != "true" ]; then
             terraform state pull > "${{ inputs.environment }}.tfstate"
             az storage blob upload \
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" \
               --container-name "${BACKEND_CONTAINER}" \
-              --name "${BACKEND_KEY}" \
+              --name "${EFFECTIVE_BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${BACKEND_KEY}"
+            echo "Created backend state: ${EFFECTIVE_BACKEND_KEY}"
           else
-            echo "Backend state exists: ${BACKEND_KEY}"
+            echo "Backend state exists: ${EFFECTIVE_BACKEND_KEY}"
           fi
