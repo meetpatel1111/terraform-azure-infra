@@ -42,16 +42,32 @@ module "subnets" {
 # ------------
 locals {
   vm_subnet_id = module.subnets[var.vm.subnet_key].id
-  vm_prefix    = trim("${local.svc.vm}${var.vm.role_suffix != "" ? "-${var.vm.role_suffix}" : ""}-${var.environment_type}-${var.location_code}-${var.environment_name}")
+
+  vm_prefix = join(
+    "-",
+    compact([
+      local.svc.vm,
+      var.vm.role_suffix != "" ? var.vm.role_suffix : null,
+      var.environment_type,
+      var.location_code,
+      var.environment_name
+    ])
+  )
+}
+
+# Auto-generated SSH keypair for VMs
+resource "tls_private_key" "vm" {
+  algorithm = "ED25519"
 }
 
 module "vm" {
-  source              = "./modules/vm"
-  count               = var.vm.count > 0 ? 1 : 0
-  name_prefix         = local.vm_prefix
-  vm_count            = var.vm.count
-  size                = var.vm.size
-  admin_username      = var.vm.admin_username
+  source         = "./modules/vm"
+  count          = var.vm.count > 0 ? 1 : 0
+  name_prefix    = local.vm_prefix
+  vm_count       = var.vm.count
+  size           = var.vm.size
+  admin_username = var.vm.admin_username
+  # Use generated OpenSSH public key
   ssh_public_key      = tls_private_key.vm.public_key_openssh
   subnet_id           = local.vm_subnet_id
   public_ip           = try(var.vm.public_ip, true)
@@ -104,7 +120,7 @@ module "storage_account" {
 }
 
 # -------------
-# Key Vault (kv-...)
+# Key Vault (kv-...) — module without inline access_policies
 # -------------
 module "key_vault" {
   source                        = "./modules/key_vault"
@@ -116,16 +132,37 @@ module "key_vault" {
   public_network_access_enabled = try(var.key_vault.public_network_access_enabled, true)
   tenant_id                     = data.azurerm_client_config.current.tenant_id
   tags                          = var.tags
+}
 
-  access_policies = [
-    {
-      object_id               = data.azurerm_client_config.current.object_id
-      secret_permissions      = ["Get", "List", "Set", "Delete", "Purge", "Recover", "Backup", "Restore"]
-      key_permissions         = []
-      certificate_permissions = []
-      storage_permissions     = []
-    }
+# Grant current principal secret permissions on the vault (if using access policies)
+resource "azurerm_key_vault_access_policy" "current" {
+  count        = var.key_vault.enabled ? 1 : 0
+  key_vault_id = module.key_vault[0].id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = data.azurerm_client_config.current.object_id
+
+  secret_permissions = [
+    "Get", "List", "Set", "Delete", "Purge", "Recover", "Backup", "Restore"
   ]
+}
+
+# Store generated keys in Key Vault (only when KV + VM are enabled)
+resource "azurerm_key_vault_secret" "vm_private_key" {
+  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-private-key"
+  value        = tls_private_key.vm.private_key_pem
+  content_type = "application/x-pem-file"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [azurerm_key_vault_access_policy.current]
+}
+
+resource "azurerm_key_vault_secret" "vm_public_key" {
+  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-public-key"
+  value        = tls_private_key.vm.public_key_openssh
+  content_type = "text/plain"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [azurerm_key_vault_access_policy.current]
 }
 
 # ----------------------
@@ -196,28 +233,4 @@ module "bastion" {
   sku                   = try(var.bastion.sku, "Basic")
   scale_units           = try(var.bastion.scale_units, 2)
   tags                  = var.tags
-}
-
-# Auto-generated SSH keypair for VMs
-resource "tls_private_key" "vm" {
-  algorithm = "ED25519"
-}
-
-# Store generated keys in Key Vault (only when KV + VM are enabled)
-resource "azurerm_key_vault_secret" "vm_private_key" {
-  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
-  name         = "vm-ssh-private-key"
-  value        = tls_private_key.vm.private_key_pem
-  content_type = "application/x-pem-file"
-  key_vault_id = module.key_vault[0].id
-  depends_on   = [module.key_vault]
-}
-
-resource "azurerm_key_vault_secret" "vm_public_key" {
-  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
-  name         = "vm-ssh-public-key"
-  value        = tls_private_key.vm.public_key_openssh
-  content_type = "text/plain"
-  key_vault_id = module.key_vault[0].id
-  depends_on   = [module.key_vault]
 }
