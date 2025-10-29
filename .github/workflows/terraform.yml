@@ -205,6 +205,30 @@ jobs:
         if: ${{ inputs.tf_action == 'apply' }}
         run: terraform apply -auto-approve "tfplan-${{ inputs.environment }}.bin"
 
+      # Snapshot & upload state after normal apply
+      - name: Snapshot and upload state (apply)
+        if: ${{ inputs.tf_action == 'apply' }}
+        env:
+          BACKEND_SA: ${{ env.BACKEND_SA }}
+          BACKEND_CONTAINER: ${{ env.BACKEND_CONTAINER }}
+          BACKEND_KEY: ${{ env.BACKEND_KEY }}
+        run: |
+          set -euo pipefail
+          TS=$(date -u +"%Y%m%dT%H%M%SZ")
+          BASE_DIR=$(dirname "${BACKEND_KEY}")
+          BASE_FILE=$(basename "${BACKEND_KEY}" .tfstate)
+          SNAP_BLOB="${BASE_DIR}/${BASE_FILE}/snapshots/${TS}-${GITHUB_RUN_ID}.tfstate"
+          echo "Pulling current state and uploading to '${SNAP_BLOB}'..."
+          terraform state pull > state.tfstate
+          az storage blob upload \
+            --account-name "${BACKEND_SA}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${SNAP_BLOB}" \
+            --file state.tfstate \
+            --auth-mode login \
+            --overwrite true >/dev/null
+          echo "Uploaded snapshot: ${SNAP_BLOB}"
+
       - name: Terraform Destroy (requires environment approval)
         if: ${{ inputs.tf_action == 'destroy' }}
         run: terraform destroy -auto-approve -var-file="${{ steps.tfvars.outputs.file }}"
@@ -231,3 +255,27 @@ jobs:
       - name: Terraform Apply (refresh-only)
         if: ${{ inputs.tf_action == 'refresh-apply' }}
         run: terraform apply -auto-approve "tfplan-refresh-${{ inputs.environment }}.bin"
+
+      # Snapshot & upload state after refresh-apply
+      - name: Snapshot and upload state (refresh-apply)
+        if: ${{ inputs.tf_action == 'refresh-apply' }}
+        env:
+          BACKEND_SA: ${{ env.BACKEND_SA }}
+          BACKEND_CONTAINER: ${{ env.BACKEND_CONTAINER }}
+          BACKEND_KEY: ${{ env.BACKEND_KEY }}
+        run: |
+          set -euo pipefail
+          TS=$(date -u +"%Y%m%dT%H%M%SZ")
+          BASE_DIR=$(dirname "${BACKEND_KEY}")
+          BASE_FILE=$(basename "${BACKEND_KEY}" .tfstate)
+          SNAP_BLOB="${BASE_DIR}/${BASE_FILE}/snapshots/${TS}-${GITHUB_RUN_ID}.tfstate"
+          echo "Pulling refreshed state and uploading to '${SNAP_BLOB}'..."
+          terraform state pull > state.tfstate
+          az storage blob upload \
+            --account-name "${BACKEND_SA}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${SNAP_BLOB}" \
+            --file state.tfstate \
+            --auth-mode login \
+            --overwrite true >/dev/null
+          echo "Uploaded snapshot: ${SNAP_BLOB}"
