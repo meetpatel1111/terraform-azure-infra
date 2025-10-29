@@ -1,7 +1,5 @@
 resource "azurerm_data_factory" "this" {
-  identity { 
-    type = "SystemAssigned" 
-  }
+  identity { type = "SystemAssigned" }
   managed_virtual_network_enabled = var.managed_virtual_network_enabled
   name                            = var.name
   location                        = var.location
