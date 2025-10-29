@@ -38,7 +38,7 @@ on:
         required: false
         default: "1.7.5"
       backend_rg:
-        default: "tfstate-shared-rg"
+        default: "tfstate-uks-shared-rg"
         description: "Backend: Resource Group"
         type: string
         required: true
