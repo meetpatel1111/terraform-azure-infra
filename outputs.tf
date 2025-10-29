@@ -12,11 +12,13 @@ output "subnet_names" {
 }
 
 output "vm_names" {
-  value = module.vm.names
+  description = "All VM names from the vm module(s)"
+  value       = flatten([for m in module.vm : m.names])
 }
 
 output "vm_public_ips" {
-  value = module.vm.public_ip_addresses
+  description = "All VM public IPs from the vm module(s)"
+  value       = flatten([for m in module.vm : m.public_ip_addresses])
 }
 
 output "databricks_workspace_url" {
