@@ -104,12 +104,11 @@ resource "azurerm_virtual_machine_data_disk_attachment" "attach" {
 }
 
 # Outputs
+# Works with both count and for_each resources
 output "names" {
-  description = "Deployed VM names"
-  value       = [for k in local.vm_indexes : azurerm_linux_virtual_machine.this[k].name]
+  value = try(values(azurerm_linux_virtual_machine.this)[*].name, [])
 }
 
 output "public_ip_addresses" {
-  description = "Public IPs (if enabled)"
-  value       = var.public_ip ? [for k in local.vm_indexes : azurerm_public_ip.this[k].ip_address] : []
+  value = var.public_ip ? try(values(azurerm_public_ip.this)[*].ip_address, []) : []
 }
