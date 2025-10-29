@@ -81,7 +81,6 @@ jobs:
       BACKEND_RG:        ${{ inputs.backend_rg }}
       BACKEND_SA:        ${{ inputs.backend_storage_account }}
       BACKEND_CONTAINER: ${{ inputs.backend_container }}
-      # Backend state blob will be <prefix>/<env>.tfstate, e.g., iac/core/dev.tfstate
       BACKEND_KEY:       ${{ inputs.backend_key_prefix }}/${{ inputs.environment }}.tfstate
 
       TF_IN_AUTOMATION: "true"
@@ -91,8 +90,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Terraform Version
-        run: echo "TF_VERSION=${{ inputs.tf_version }}" >> $GITHUB_ENV
+      - name: Set Terraform version
+        run: echo "TF_VERSION=${{ inputs.tf_version }}" >> "$GITHUB_ENV"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -109,31 +108,24 @@ jobs:
           az account show
           echo "Backend key: ${BACKEND_KEY}"
 
-      # Ensure backend and grab the storage account key for all data-plane ops
-      - name: Ensure Backend (RG/SA/Container) using account key
+      - name: Ensure backend (RG/SA/Container) using account key
         id: ensure_backend
         run: |
           set -euo pipefail
-
           az group create -n "${BACKEND_RG}" -l "${{ inputs.location }}" >/dev/null
-
           if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
             az storage account create \
               -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${{ inputs.location }}" \
               --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
           fi
-
           az storage account blob-service-properties update \
             -n "${BACKEND_SA}" -g "${BACKEND_RG}" \
             --enable-versioning true \
             --enable-change-feed true \
             --enable-delete-retention true --delete-retention-days 7 \
             --enable-container-delete-retention true --container-delete-retention-days 7 >/dev/null
-
-          # Get account key for data-plane ops (avoids needing Blob Data RBAC)
           STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
           echo "storage_key=${STORAGE_KEY}" >> "$GITHUB_OUTPUT"
-
           if ! az storage container show \
               --name "${BACKEND_CONTAINER}" \
               --account-name "${BACKEND_SA}" \
@@ -143,16 +135,20 @@ jobs:
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" >/dev/null
           fi
-          echo "✅ Backend ready."
+          echo "Backend ready."
 
       - name: Select tfvars
         id: tfvars
         run: |
+          set -euo pipefail
           FILE="env/${{ inputs.environment }}.tfvars"
-          [ -f "$FILE" ] || (echo "Missing env file $FILE" && exit 1)
-          echo "file=$FILE" >> $GITHUB_OUTPUT
+          if [ ! -f "$FILE" ]; then
+            echo "Missing env file $FILE"
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Terraform Init (remote backend)
+      - name: Terraform init (remote backend)
         run: |
           terraform init -reconfigure \
             -backend-config="resource_group_name=${BACKEND_RG}" \
@@ -160,13 +156,12 @@ jobs:
             -backend-config="container_name=${BACKEND_CONTAINER}" \
             -backend-config="key=${BACKEND_KEY}"
 
-      - name: Terraform Format Check
+      - name: Terraform fmt
         run: terraform fmt -check -recursive
 
-      - name: Terraform Validate
+      - name: Terraform validate
         run: terraform validate
 
-      # ---------- Show current state (helps catch empty/incorrect state) ----------
       - name: Show backend state content (resource list)
         run: |
           set -euo pipefail
@@ -175,15 +170,14 @@ jobs:
           echo "Resource list:"
           terraform state list || echo "(state empty)"
 
-      # ---------- PLAN ----------
-      - name: Terraform Plan (writes <env>.tfplan)
+      - name: Terraform plan (writes <env>.tfplan)
         if: ${{ inputs.tf_action == 'plan' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
           terraform plan -input=false -var-file="$TFVARS_FILE" -out="${{ inputs.environment }}.tfplan"
 
-      - name: Upload <env>.tfplan
+      - name: Upload plan artifact
         if: ${{ inputs.tf_action == 'plan' }}
         uses: actions/upload-artifact@v4
         with:
@@ -192,8 +186,7 @@ jobs:
           if-no-files-found: error
           retention-days: 10
 
-      # ---------- APPLY ----------
-      - name: Terraform Apply (plan → apply, <env>.tfplan)
+      - name: Terraform apply (from <env>.tfplan)
         if: ${{ inputs.tf_action == 'apply' }}
         run: |
           set -euo pipefail
@@ -201,7 +194,7 @@ jobs:
           terraform plan -input=false -var-file="$TFVARS_FILE" -out="${{ inputs.environment }}.tfplan"
           terraform apply -input=false -auto-approve "${{ inputs.environment }}.tfplan"
 
-      - name: Ensure backend <env>.tfstate exists (post-apply)
+      - name: Ensure backend state exists (post-apply)
         if: ${{ inputs.tf_action == 'apply' }}
         env:
           STORAGE_KEY: ${{ steps.ensure_backend.outputs.storage_key }}
@@ -221,13 +214,12 @@ jobs:
               --name "${BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${BACKEND_KEY}"
+            echo "Created backend state at ${BACKEND_KEY}"
           else
-            echo "Backend state exists: ${BACKEND_KEY}"
+            echo "Backend state exists at ${BACKEND_KEY}"
           fi
 
-      # ---------- DESTROY ----------
-      - name: Guard: state must not be empty before destroy
+      - name: Guard - state must not be empty before destroy
         if: ${{ inputs.tf_action == 'destroy' }}
         run: |
           set -euo pipefail
@@ -240,7 +232,7 @@ jobs:
             exit 1
           fi
 
-      - name: Terraform Destroy (plan-destroy → apply)
+      - name: Terraform destroy
         if: ${{ inputs.tf_action == 'destroy' }}
         run: |
           set -euo pipefail
@@ -248,15 +240,14 @@ jobs:
           terraform plan -destroy -input=false -var-file="$TFVARS_FILE" -out=tfplan-destroy
           terraform apply -input=false -auto-approve tfplan-destroy
 
-      # ---------- REFRESH ----------
-      - name: Terraform Refresh (state-only)
+      - name: Terraform refresh (state-only)
         if: ${{ inputs.tf_action == 'refresh' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
           terraform refresh -input=false -var-file="$TFVARS_FILE"
 
-      - name: Ensure backend <env>.tfstate exists (post-refresh)
+      - name: Ensure backend state exists (post-refresh)
         if: ${{ inputs.tf_action == 'refresh' }}
         env:
           STORAGE_KEY: ${{ steps.ensure_backend.outputs.storage_key }}
@@ -276,7 +267,7 @@ jobs:
               --name "${BACKEND_KEY}" \
               --file "${{ inputs.environment }}.tfstate" \
               --overwrite true >/dev/null
-            echo "Created backend state: ${BACKEND_KEY}"
+            echo "Created backend state at ${BACKEND_KEY}"
           else
-            echo "Backend state exists: ${BACKEND_KEY}"
+            echo "Backend state exists at ${BACKEND_KEY}"
           fi
