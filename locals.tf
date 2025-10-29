@@ -32,7 +32,7 @@ locals {
     rg   = "${local.svc.rg}-${local.seg}"
     vnet = "${local.svc.vnet}-${local.seg}"
     adb  = "${local.svc.adb}-${local.seg}"
-    adf  = "${local.svc.adf}-${local.seg}"
+    adf  = "${local.svc.adf}-${local.seg}-01"
     sa   = "${local.svc.sa}-${local.seg}"
     kv   = "${local.svc.kv}-${local.seg}"
     law  = "${local.svc.law}-${local.seg}"
