@@ -95,13 +95,17 @@ module "databricks" {
 # Azure Data Factory
 # ----------------
 module "datafactory" {
-  source                 = "./modules/datafactory"
-  count                  = var.datafactory.enabled ? 1 : 0
-  name                   = local.names.adf
-  resource_group_name    = module.resource_group.name
-  location               = var.location
-  public_network_enabled = try(var.datafactory.public_network_enabled, true)
-  tags                   = var.tags
+  source                          = "./modules/datafactory"
+  count                           = var.datafactory.enabled ? 1 : 0
+  name                            = local.names.adf
+  resource_group_name             = module.resource_group.name
+  location                        = var.location
+  managed_virtual_network_enabled = true
+  public_network_enabled          = false
+  key_vault_id                    = module.key_vault[0].id
+  storage_account_id              = module.storage_account[0].id
+  sql_server_id                   = module.sql[0].server_id
+  tags                            = var.tags
 }
 
 # ------------------
