@@ -12,7 +12,7 @@ on:
       tf_action:
         description: "Terraform action"
         type: choice
-        options: [plan, apply, destroy, refresh]
+        options: [plan, apply, destroy, refresh, import]  # ⬅️ added import
         required: true
         default: plan
       environment_type:
@@ -56,6 +56,26 @@ on:
         type: string
         required: false
         default: "iac/core"
+      # ------- Import support (new) -------
+      import_address:
+        description: "(import) Single address to import, e.g. azurerm_resource_group.example"
+        type: string
+        required: false
+        default: ""
+      import_id:
+        description: "(import) Single ID to import, e.g. /subscriptions/.../resourceGroups/my-rg-prod"
+        type: string
+        required: false
+        default: ""
+      import_pairs:
+        description: |-
+          (import) Multiple imports; one per line. Use '=' or '|' as separator.
+          Examples:
+            azurerm_resource_group.example=/subscriptions/.../resourceGroups/my-rg-prod
+            azurerm_key_vault_access_policy.current[0]|/subscriptions/.../objectId/<GUID>
+        type: string
+        required: false
+        default: ""
 
 jobs:
   terraform:
@@ -155,6 +175,55 @@ jobs:
             -backend-config="storage_account_name=${BACKEND_SA}" \
             -backend-config="container_name=${BACKEND_CONTAINER}" \
             -backend-config="key=${BACKEND_KEY}"
+
+      # ----------------------------------------------
+      # Terraform import (no heredoc; YAML-safe)
+      # ----------------------------------------------
+      - name: Terraform import
+        if: ${{ inputs.tf_action == 'import' }}
+        run: |
+          set -euo pipefail
+          TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
+
+          # Write import_pairs to a temp file (avoids YAML/heredoc issues)
+          printf "%s\n" "${{ inputs.import_pairs }}" > imports.txt
+
+          do_import () {
+            local address="$1"
+            local id="$2"
+            echo "::group::terraform import ${address}"
+            echo "ID: ${id}"
+            terraform import -input=false -var-file="${TFVARS_FILE}" "${address}" "${id}"
+            terraform state show "${address}" || true
+            echo "::endgroup::"
+          }
+
+          if [ -s imports.txt ] && [ "$(wc -c < imports.txt)" -gt 1 ]; then
+            echo "Processing multiple imports from import_pairs..."
+            while IFS= read -r line; do
+              # trim
+              line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+              [ -z "$line" ] && continue
+              # '=' preferred, '|' supported
+              if echo "$line" | grep -q '='; then
+                addr="${line%%=*}"
+                rid="${line#*=}"
+              else
+                addr="${line%%|*}"
+                rid="${line#*|}"
+              fi
+              [ -z "$addr" ] || [ -z "$rid" ] && { echo "Skipping malformed line: $line"; continue; }
+              do_import "$addr" "$rid"
+            done < imports.txt
+          else
+            if [ -z "${{ inputs.import_address }}" ] || [ -z "${{ inputs.import_id }}" ]; then
+              echo "ERROR: Provide either import_pairs, or both import_address and import_id."
+              exit 1
+            fi
+            do_import "${{ inputs.import_address }}" "${{ inputs.import_id }}"
+          fi
+
+          echo "Imports completed."
 
       - name: Terraform fmt
         run: terraform fmt -check -recursive
