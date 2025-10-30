@@ -140,7 +140,7 @@ module "key_vault" {
 
 # Grant current principal secret permissions on the vault (if using access policies)
 resource "azurerm_key_vault_access_policy" "current" {
-  count        = var.key_vault.enabled ? 1 : 0
+  count = var.key_vault.enabled ? 1 : 0
 
   key_vault_id = module.key_vault[0].id
   tenant_id    = data.azurerm_client_config.current.tenant_id
