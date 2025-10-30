@@ -271,3 +271,86 @@ jobs:
           else
             echo "Backend state exists at ${BACKEND_KEY}"
           fi
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ALWAYS collect a state snapshot (best-effort), even if Terraform failed
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Collect Terraform state snapshot (always)
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+
+          SNAP="snapshot.tfstate"
+
+          # 1) Try remote state
+          terraform state pull > "$SNAP" 2>/dev/null || true
+
+          # 2) Fallback to local working copy
+          if [ ! -s "$SNAP" ] && [ -f ".terraform/terraform.tfstate" ]; then
+            cp .terraform/terraform.tfstate "$SNAP"
+          fi
+
+          # 3) Last resort: write minimal placeholder so we always update the blob
+          if [ ! -s "$SNAP" ]; then
+            echo '{}' > "$SNAP"
+          fi
+
+          # Small meta for troubleshooting
+          {
+            echo "{"
+            echo "  \"job_status\": \"${{ job.status }}\","
+            echo "  \"tf_action\": \"${{ inputs.tf_action }}\","
+            echo "  \"environment\": \"${{ inputs.environment }}\","
+            echo "  \"timestamp_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "}"
+          } > snapshot.meta.json
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # ALWAYS upload the snapshot to THE SAME BACKEND KEY
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: Upload state snapshot to backend (always to same key)
+        if: ${{ always() }}
+        env:
+          BACKEND_RG:        ${{ env.BACKEND_RG }}
+          BACKEND_SA:        ${{ env.BACKEND_SA }}
+          BACKEND_CONTAINER: ${{ env.BACKEND_CONTAINER }}
+          BACKEND_KEY:       ${{ env.BACKEND_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Reacquire prerequisites even if earlier steps failed
+          az group create -n "${BACKEND_RG}" -l "${{ inputs.location }}" >/dev/null || true
+          if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
+            az storage account create \
+              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${{ inputs.location }}" \
+              --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
+          fi
+
+          STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
+          if ! az storage container show \
+              --name "${BACKEND_CONTAINER}" \
+              --account-name "${BACKEND_SA}" \
+              --account-key "${STORAGE_KEY}" >/dev/null 2>&1; then
+            az storage container create \
+              --name "${BACKEND_CONTAINER}" \
+              --account-name "${BACKEND_SA}" \
+              --account-key "${STORAGE_KEY}" >/dev/null
+          fi
+
+          # Upload snapshot to the SAME key, always
+          az storage blob upload \
+            --account-name "${BACKEND_SA}" \
+            --account-key "${STORAGE_KEY}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${BACKEND_KEY}" \
+            --file snapshot.tfstate \
+            --overwrite true >/dev/null
+
+          # Upload meta alongside it (optional)
+          az storage blob upload \
+            --account-name "${BACKEND_SA}" \
+            --account-key "${STORAGE_KEY}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${BACKEND_KEY}.meta.json" \
+            --file snapshot.meta.json \
+            --overwrite true >/dev/null || true
