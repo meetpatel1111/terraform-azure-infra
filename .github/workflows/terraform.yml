@@ -12,7 +12,7 @@ on:
       tf_action:
         description: "Terraform action"
         type: choice
-        options: [plan, apply, destroy, refresh, import]  # ⬅️ added import
+        options: [plan, apply, destroy, refresh, import]  # added import
         required: true
         default: plan
       environment_type:
@@ -21,16 +21,6 @@ on:
         options: [np, p]
         required: true
         default: np
-      location:
-        description: "Azure region display name (e.g., 'UK South')"
-        type: string
-        required: true
-        default: "UK South"
-      location_code:
-        description: "Short region code used in names (e.g., 'uks')"
-        type: string
-        required: true
-        default: "uks"
       tf_version:
         description: "Terraform version"
         type: string
@@ -56,21 +46,10 @@ on:
         type: string
         required: false
         default: "iac/core"
-      # ------- Import support (new) -------
-      import_address:
-        description: "(import) Single address to import, e.g. azurerm_resource_group.example"
-        type: string
-        required: false
-        default: ""
-      import_id:
-        description: "(import) Single ID to import, e.g. /subscriptions/.../resourceGroups/my-rg-prod"
-        type: string
-        required: false
-        default: ""
       import_pairs:
         description: |-
-          (import) Multiple imports; one per line. Use '=' or '|' as separator.
-          Examples:
+          (import) One per line; '=' or '|' separator.
+          Example:
             azurerm_resource_group.example=/subscriptions/.../resourceGroups/my-rg-prod
             azurerm_key_vault_access_policy.current[0]|/subscriptions/.../objectId/<GUID>
         type: string
@@ -95,8 +74,6 @@ jobs:
 
       TF_VAR_environment_type: ${{ inputs.environment_type }}
       TF_VAR_environment_name: ${{ inputs.environment }}
-      TF_VAR_location: ${{ inputs.location }}
-      TF_VAR_location_code: ${{ inputs.location_code }}
 
       BACKEND_RG:        ${{ inputs.backend_rg }}
       BACKEND_SA:        ${{ inputs.backend_storage_account }}
@@ -128,14 +105,35 @@ jobs:
           az account show
           echo "Backend key: ${BACKEND_KEY}"
 
+      - name: Select tfvars
+        id: tfvars
+        run: |
+          set -euo pipefail
+          FILE="env/${{ inputs.environment }}.tfvars"
+          if [ ! -f "$FILE" ]; then
+            echo "Missing env file $FILE"
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Derive location from tfvars
+        run: |
+          set -euo pipefail
+          TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
+          # Try to extract:  location = "UK South"
+          LOC=$(awk -F'"' '/^[[:space:]]*location[[:space:]]*=/ {print $2; exit}' "$TFVARS_FILE" || true)
+          if [ -z "$LOC" ]; then LOC="UK South"; fi
+          echo "Using location: $LOC"
+          echo "BACKEND_LOCATION=$LOC" >> "$GITHUB_ENV"
+
       - name: Ensure backend (RG/SA/Container) using account key
         id: ensure_backend
         run: |
           set -euo pipefail
-          az group create -n "${BACKEND_RG}" -l "${{ inputs.location }}" >/dev/null
+          az group create -n "${BACKEND_RG}" -l "${BACKEND_LOCATION}" >/dev/null
           if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
             az storage account create \
-              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${{ inputs.location }}" \
+              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${BACKEND_LOCATION}" \
               --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
           fi
           az storage account blob-service-properties update \
@@ -157,17 +155,6 @@ jobs:
           fi
           echo "Backend ready."
 
-      - name: Select tfvars
-        id: tfvars
-        run: |
-          set -euo pipefail
-          FILE="env/${{ inputs.environment }}.tfvars"
-          if [ ! -f "$FILE" ]; then
-            echo "Missing env file $FILE"
-            exit 1
-          fi
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
-
       - name: Terraform init (remote backend)
         run: |
           terraform init -reconfigure \
@@ -176,16 +163,14 @@ jobs:
             -backend-config="container_name=${BACKEND_CONTAINER}" \
             -backend-config="key=${BACKEND_KEY}"
 
-      # ----------------------------------------------
-      # Terraform import (no heredoc; YAML-safe)
-      # ----------------------------------------------
+      # -------------------------------
+      # Terraform import (heredoc-free)
+      # -------------------------------
       - name: Terraform import
         if: ${{ inputs.tf_action == 'import' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-
-          # Write import_pairs to a temp file (avoids YAML/heredoc issues)
           printf "%s\n" "${{ inputs.import_pairs }}" > imports.txt
 
           do_import () {
@@ -201,10 +186,8 @@ jobs:
           if [ -s imports.txt ] && [ "$(wc -c < imports.txt)" -gt 1 ]; then
             echo "Processing multiple imports from import_pairs..."
             while IFS= read -r line; do
-              # trim
               line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
               [ -z "$line" ] && continue
-              # '=' preferred, '|' supported
               if echo "$line" | grep -q '='; then
                 addr="${line%%=*}"
                 rid="${line#*=}"
@@ -216,11 +199,7 @@ jobs:
               do_import "$addr" "$rid"
             done < imports.txt
           else
-            if [ -z "${{ inputs.import_address }}" ] || [ -z "${{ inputs.import_id }}" ]; then
-              echo "ERROR: Provide either import_pairs, or both import_address and import_id."
-              exit 1
-            fi
-            do_import "${{ inputs.import_address }}" "${{ inputs.import_id }}"
+            echo "No import_pairs provided; nothing to import."
           fi
 
           echo "Imports completed."
@@ -348,23 +327,14 @@ jobs:
         if: ${{ always() }}
         run: |
           set -euo pipefail
-
           SNAP="snapshot.tfstate"
-
-          # 1) Try remote state
           terraform state pull > "$SNAP" 2>/dev/null || true
-
-          # 2) Fallback to local working copy
           if [ ! -s "$SNAP" ] && [ -f ".terraform/terraform.tfstate" ]; then
             cp .terraform/terraform.tfstate "$SNAP"
           fi
-
-          # 3) Last resort: write minimal placeholder so we always update the blob
           if [ ! -s "$SNAP" ]; then
             echo '{}' > "$SNAP"
           fi
-
-          # Small meta for troubleshooting
           {
             echo "{"
             echo "  \"job_status\": \"${{ job.status }}\","
@@ -386,15 +356,12 @@ jobs:
           BACKEND_KEY:       ${{ env.BACKEND_KEY }}
         run: |
           set -euo pipefail
-
-          # Reacquire prerequisites even if earlier steps failed
-          az group create -n "${BACKEND_RG}" -l "${{ inputs.location }}" >/dev/null || true
+          az group create -n "${BACKEND_RG}" -l "${BACKEND_LOCATION}" >/dev/null || true
           if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
             az storage account create \
-              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${{ inputs.location }}" \
+              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${BACKEND_LOCATION}" \
               --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
           fi
-
           STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
           if ! az storage container show \
               --name "${BACKEND_CONTAINER}" \
@@ -405,8 +372,6 @@ jobs:
               --account-name "${BACKEND_SA}" \
               --account-key "${STORAGE_KEY}" >/dev/null
           fi
-
-          # Upload snapshot to the SAME key, always
           az storage blob upload \
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
@@ -414,8 +379,6 @@ jobs:
             --name "${BACKEND_KEY}" \
             --file snapshot.tfstate \
             --overwrite true >/dev/null
-
-          # Upload meta alongside it (optional)
           az storage blob upload \
             --account-name "${BACKEND_SA}" \
             --account-key "${STORAGE_KEY}" \
