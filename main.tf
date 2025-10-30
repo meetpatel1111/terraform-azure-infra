@@ -230,15 +230,15 @@ module "sql" {
 # ----------------------
 # Bastion (creates AzureBastionSubnet internally)
 # ----------------------
-module "bastion" {
-  source                = "./modules/bastion"
-  count                 = var.bastion.enabled ? 1 : 0
-  name                  = local.names.bast
-  resource_group_name   = module.resource_group.name
-  location              = var.location
-  vnet_name             = module.vnet.name
-  subnet_address_prefix = try(var.bastion.subnet_address_prefix, "10.10.250.0/27")
-  sku                   = try(var.bastion.sku, "Basic")
-  scale_units           = try(var.bastion.scale_units, 2)
-  tags                  = var.tags
-}
+# module "bastion" {
+#   source                = "./modules/bastion"
+#   count                 = var.bastion.enabled ? 1 : 0
+#   name                  = local.names.bast
+#   resource_group_name   = module.resource_group.name
+#   location              = var.location
+#   vnet_name             = module.vnet.name
+#   subnet_address_prefix = try(var.bastion.subnet_address_prefix, "10.10.250.0/27")
+#   sku                   = try(var.bastion.sku, "Basic")
+#   scale_units           = try(var.bastion.scale_units, 2)
+#   tags                  = var.tags
+# }
