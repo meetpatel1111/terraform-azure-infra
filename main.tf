@@ -1,3 +1,5 @@
+data "azurerm_client_config" "current" {}
+
 # =============
 # Resource Group
 # =============
@@ -141,6 +143,7 @@ module "key_vault" {
 # Grant current principal secret permissions on the vault (if using access policies)
 resource "azurerm_key_vault_access_policy" "current" {
   count        = var.key_vault.enabled ? 1 : 0
+
   key_vault_id = module.key_vault[0].id
   tenant_id    = data.azurerm_client_config.current.tenant_id
   object_id    = data.azurerm_client_config.current.object_id
@@ -148,8 +151,11 @@ resource "azurerm_key_vault_access_policy" "current" {
   secret_permissions = [
     "Get", "List", "Set", "Delete", "Purge", "Recover", "Backup", "Restore"
   ]
-}
 
+  lifecycle {
+    ignore_changes = [secret_permissions]
+  }
+}
 # Store generated keys in Key Vault (only when KV + VM are enabled)
 resource "azurerm_key_vault_secret" "vm_private_key" {
   count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0

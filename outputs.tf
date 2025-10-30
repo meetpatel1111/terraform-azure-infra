@@ -43,7 +43,9 @@ output "log_analytics_workspace_id" {
 
 output "application_insights_connection_string" {
   value = try(module.app_insights[0].connection_string, null)
+  sensitive   = true
 }
+
 
 output "acr_login_server" {
   value = try(module.acr[0].login_server, null)
