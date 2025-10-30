@@ -59,9 +59,9 @@ output "sql_database_id" {
   value = try(module.sql[0].database_id, null)
 }
 
-output "bastion_name" {
-  value = try(module.bastion[0].name, null)
-}
+# output "bastion_name" {
+#   value = try(module.bastion[0].name, null)
+# }
 
 output "vm_ssh_private_key_secret_id" {
   value = try(azurerm_key_vault_secret.vm_private_key[0].id, null)
