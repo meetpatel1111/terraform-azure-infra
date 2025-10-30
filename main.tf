@@ -163,11 +163,6 @@ resource "azurerm_key_vault_access_policy" "current" {
 # - Names remain constant across runs and environments.
 # ---
 
-# Generate keys at runtime
-resource "tls_private_key" "vm" {
-  algorithm = "ED25519"
-}
-
 # Look up existing secrets (if any)
 data "azurerm_key_vault_secret" "vm_private_key_existing" {
   count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
