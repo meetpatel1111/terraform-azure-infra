@@ -154,9 +154,38 @@ resource "azurerm_key_vault_access_policy" "current" {
     ignore_changes = [secret_permissions]
   }
 }
+
 # Store generated keys in Key Vault (only when KV + VM are enabled)
-resource "azurerm_key_vault_secret" "vm_private_key" {
+# ---
+# Behavior:
+# - If the secrets already exist in the Key Vault, read them (no error, no import).
+# - If they don't exist, create them with the fixed names.
+# - Names remain constant across runs and environments.
+# ---
+
+# Generate keys at runtime
+resource "tls_private_key" "vm" {
+  algorithm = "ED25519"
+}
+
+# Look up existing secrets (if any)
+data "azurerm_key_vault_secret" "vm_private_key_existing" {
   count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-private-key"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [azurerm_key_vault_access_policy.current]
+}
+
+data "azurerm_key_vault_secret" "vm_public_key_existing" {
+  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  name         = "vm-ssh-public-key"
+  key_vault_id = module.key_vault[0].id
+  depends_on   = [azurerm_key_vault_access_policy.current]
+}
+
+# Create only when NOT present
+resource "azurerm_key_vault_secret" "vm_private_key" {
+  count        = var.key_vault.enabled && var.vm.count > 0 && length(data.azurerm_key_vault_secret.vm_private_key_existing) == 0 ? 1 : 0
   name         = "vm-ssh-private-key"
   value        = tls_private_key.vm.private_key_pem
   content_type = "application/x-pem-file"
@@ -165,7 +194,7 @@ resource "azurerm_key_vault_secret" "vm_private_key" {
 }
 
 resource "azurerm_key_vault_secret" "vm_public_key" {
-  count        = var.key_vault.enabled && var.vm.count > 0 ? 1 : 0
+  count        = var.key_vault.enabled && var.vm.count > 0 && length(data.azurerm_key_vault_secret.vm_public_key_existing) == 0 ? 1 : 0
   name         = "vm-ssh-public-key"
   value        = tls_private_key.vm.public_key_openssh
   content_type = "text/plain"
