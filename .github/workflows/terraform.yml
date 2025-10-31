@@ -1,4 +1,4 @@
-name: Terraform Azure IaC
+name: Terraform Azure IaC (Remote-state only)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
       tf_action:
         description: "Terraform action"
         type: choice
-        options: [plan, apply, destroy, refresh, import]  # added import
+        options: [plan, apply, destroy, refresh, import]
         required: true
         default: plan
       environment_type:
@@ -56,6 +56,11 @@ on:
         required: false
         default: ""
 
+# One run per env at a time to avoid state contention
+concurrency:
+  group: terraform-${{ github.workflow }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
 jobs:
   terraform:
     name: Terraform ${{ inputs.tf_action }} (${{ inputs.environment }})
@@ -67,14 +72,17 @@ jobs:
         shell: bash
 
     env:
+      # Azure creds for Terraform provider (azurerm)
       ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
       ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
 
+      # Common TF vars
       TF_VAR_environment_type: ${{ inputs.environment_type }}
       TF_VAR_environment_name: ${{ inputs.environment }}
 
+      # Backend coordinates (CI never creates/overwrites state)
       BACKEND_RG:        ${{ inputs.backend_rg }}
       BACKEND_SA:        ${{ inputs.backend_storage_account }}
       BACKEND_CONTAINER: ${{ inputs.backend_container }}
@@ -86,6 +94,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Guard – no *.tfstate committed
+        run: |
+          set -euo pipefail
+          bad=$(git ls-files | grep -E '\.tfstate(\.backup)?$' || true)
+          if [ -n "$bad" ]; then
+            echo "ERROR: The repo contains state files:"
+            echo "$bad"
+            exit 1
+          fi
 
       - name: Set Terraform version
         run: echo "TF_VERSION=${{ inputs.tf_version }}" >> "$GITHUB_ENV"
@@ -116,46 +134,50 @@ jobs:
           fi
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Derive location from tfvars
+      - name: Derive location from tfvars (best effort)
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-          # Try to extract:  location = "UK South"
           LOC=$(awk -F'"' '/^[[:space:]]*location[[:space:]]*=/ {print $2; exit}' "$TFVARS_FILE" || true)
           if [ -z "$LOC" ]; then LOC="UK South"; fi
           echo "Using location: $LOC"
           echo "BACKEND_LOCATION=$LOC" >> "$GITHUB_ENV"
 
-      - name: Ensure backend (RG/SA/Container) using account key
-        id: ensure_backend
+      # --------- Use ACCOUNT KEY to verify remote state blob exists (no creation) ----------
+      - name: Get backend storage account key
+        id: get_sa_key
         run: |
           set -euo pipefail
-          az group create -n "${BACKEND_RG}" -l "${BACKEND_LOCATION}" >/dev/null
-          if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
-            az storage account create \
-              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${BACKEND_LOCATION}" \
-              --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
+          STORAGE_KEY=$(az storage account keys list \
+            -g "${BACKEND_RG}" \
+            -n "${BACKEND_SA}" \
+            --query "[0].value" -o tsv)
+          if [ -z "$STORAGE_KEY" ]; then
+            echo "ERROR: Could not obtain storage account key for ${BACKEND_SA}."
+            exit 1
           fi
-          az storage account blob-service-properties update \
-            -n "${BACKEND_SA}" -g "${BACKEND_RG}" \
-            --enable-versioning true \
-            --enable-change-feed true \
-            --enable-delete-retention true --delete-retention-days 7 \
-            --enable-container-delete-retention true --container-delete-retention-days 7 >/dev/null
-          STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
-          echo "storage_key=${STORAGE_KEY}" >> "$GITHUB_OUTPUT"
-          if ! az storage container show \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" >/dev/null 2>&1; then
-            az storage container create \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" >/dev/null
-          fi
-          echo "Backend ready."
+          echo "storage_key=$STORAGE_KEY" >> "$GITHUB_OUTPUT"
 
-      - name: Terraform init (remote backend)
+      - name: Verify backend blob exists (account key)
+        env:
+          STORAGE_KEY: ${{ steps.get_sa_key.outputs.storage_key }}
+        run: |
+          set -euo pipefail
+          if ! az storage blob show \
+            --account-name "${BACKEND_SA}" \
+            --account-key "${STORAGE_KEY}" \
+            --container-name "${BACKEND_CONTAINER}" \
+            --name "${BACKEND_KEY}" >/dev/null 2>&1; then
+            echo "ERROR: Backend state blob does not exist or is inaccessible:"
+            echo "  sa=${BACKEND_SA}"
+            echo "  container=${BACKEND_CONTAINER}"
+            echo "  key=${BACKEND_KEY}"
+            echo "Refusing to proceed to avoid creating or overwriting state."
+            exit 1
+          fi
+          echo "Remote backend state is present."
+
+      - name: Terraform init (remote backend, reconfigure)
         run: |
           terraform init -reconfigure \
             -backend-config="resource_group_name=${BACKEND_RG}" \
@@ -163,9 +185,22 @@ jobs:
             -backend-config="container_name=${BACKEND_CONTAINER}" \
             -backend-config="key=${BACKEND_KEY}"
 
-      # -------------------------------
-      # Terraform import (heredoc-free)
-      # -------------------------------
+      - name: Guard – state is readable (pull only)
+        run: |
+          set -euo pipefail
+          if ! terraform state pull > /dev/null 2>&1 ; then
+            echo "ERROR: Could not pull remote state. Aborting to prevent any state mutation."
+            exit 1
+          fi
+          echo "Remote state pull OK."
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # ------------------------------- IMPORT -------------------------------
       - name: Terraform import
         if: ${{ inputs.tf_action == 'import' }}
         run: |
@@ -178,7 +213,7 @@ jobs:
             local id="$2"
             echo "::group::terraform import ${address}"
             echo "ID: ${id}"
-            terraform import -input=false -var-file="${TFVARS_FILE}" "${address}" "${id}"
+            terraform import -input=false -lock=true -lock-timeout=10m -var-file="${TFVARS_FILE}" "${address}" "${id}"
             terraform state show "${address}" || true
             echo "::endgroup::"
           }
@@ -201,29 +236,19 @@ jobs:
           else
             echo "No import_pairs provided; nothing to import."
           fi
-
           echo "Imports completed."
 
-      - name: Terraform fmt
-        run: terraform fmt -check -recursive
-
-      - name: Terraform validate
-        run: terraform validate
-
-      - name: Show backend state content (resource list)
-        run: |
-          set -euo pipefail
-          terraform state pull > current.tfstate || true
-          echo "State blob key: ${BACKEND_KEY}"
-          echo "Resource list:"
-          terraform state list || echo "(state empty)"
-
+      # ------------------------------- PLAN -------------------------------
       - name: Terraform plan (writes <env>.tfplan)
         if: ${{ inputs.tf_action == 'plan' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-          terraform plan -input=false -var-file="$TFVARS_FILE" -out="${{ inputs.environment }}.tfplan"
+          terraform plan \
+            -input=false \
+            -lock=true -lock-timeout=10m \
+            -var-file="$TFVARS_FILE" \
+            -out="${{ inputs.environment }}.tfplan"
 
       - name: Upload plan artifact
         if: ${{ inputs.tf_action == 'plan' }}
@@ -234,49 +259,51 @@ jobs:
           if-no-files-found: error
           retention-days: 10
 
-      - name: Terraform apply (from <env>.tfplan)
+      # ------------------------------- APPLY -------------------------------
+      - name: Guard – backend non-empty before apply
+        if: ${{ inputs.tf_action == 'apply' }}
+        run: |
+          set -euo pipefail
+          pulled=$(mktemp)
+          terraform state pull > "$pulled"
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          fi
+          count=$(jq '.resources | length' "$pulled" 2>/dev/null || echo 0)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: Remote state appears empty. Refusing to apply to avoid clobbering existing infra."
+            exit 1
+          fi
+          echo "Remote state has $count tracked resources – OK."
+
+      - name: Terraform apply (create plan and apply)
         if: ${{ inputs.tf_action == 'apply' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-          terraform plan -input=false -var-file="$TFVARS_FILE" -out="${{ inputs.environment }}.tfplan"
+          terraform plan \
+            -input=false \
+            -lock=true -lock-timeout=10m \
+            -var-file="$TFVARS_FILE" \
+            -out="${{ inputs.environment }}.tfplan"
           terraform apply -input=false -auto-approve "${{ inputs.environment }}.tfplan"
 
-      - name: Ensure backend state exists (post-apply)
-        if: ${{ inputs.tf_action == 'apply' }}
-        env:
-          STORAGE_KEY: ${{ steps.ensure_backend.outputs.storage_key }}
-        run: |
-          set -euo pipefail
-          EXISTS=$(az storage blob exists \
-            --account-name "${BACKEND_SA}" \
-            --account-key "${STORAGE_KEY}" \
-            --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}" --query exists -o tsv)
-          if [ "${EXISTS}" != "true" ]; then
-            terraform state pull > "${{ inputs.environment }}.tfstate"
-            az storage blob upload \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" \
-              --container-name "${BACKEND_CONTAINER}" \
-              --name "${BACKEND_KEY}" \
-              --file "${{ inputs.environment }}.tfstate" \
-              --overwrite true >/dev/null
-            echo "Created backend state at ${BACKEND_KEY}"
-          else
-            echo "Backend state exists at ${BACKEND_KEY}"
-          fi
-
-      - name: Guard - state must not be empty before destroy
+      # ------------------------------- DESTROY -------------------------------
+      - name: Guard – state must not be empty before destroy
         if: ${{ inputs.tf_action == 'destroy' }}
         run: |
           set -euo pipefail
-          terraform state pull > current.tfstate || true
-          COUNT=$(jq '.resources | length' current.tfstate 2>/dev/null || echo 0)
+          pulled=$(mktemp)
+          terraform state pull > "$pulled" || true
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          fi
+          COUNT=$(jq '.resources | length' "$pulled" 2>/dev/null || echo 0)
           echo "Resource count in state: $COUNT"
           if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: Backend state is empty. Check BACKEND_KEY and workspace."
-            echo "Current backend key: ${BACKEND_KEY}"
+            echo "ERROR: Backend state is empty or unreadable. Check BACKEND_KEY and access."
             exit 1
           fi
 
@@ -285,104 +312,25 @@ jobs:
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-          terraform plan -destroy -input=false -var-file="$TFVARS_FILE" -out=tfplan-destroy
+          terraform plan -destroy \
+            -input=false \
+            -lock=true -lock-timeout=10m \
+            -var-file="$TFVARS_FILE" \
+            -out=tfplan-destroy
           terraform apply -input=false -auto-approve tfplan-destroy
 
+      # ------------------------------- REFRESH -------------------------------
       - name: Terraform refresh (state-only)
         if: ${{ inputs.tf_action == 'refresh' }}
         run: |
           set -euo pipefail
           TFVARS_FILE="${{ steps.tfvars.outputs.file }}"
-          terraform refresh -input=false -var-file="$TFVARS_FILE"
+          terraform refresh -input=false -lock=true -lock-timeout=10m -var-file="$TFVARS_FILE"
 
-      - name: Ensure backend state exists (post-refresh)
-        if: ${{ inputs.tf_action == 'refresh' }}
-        env:
-          STORAGE_KEY: ${{ steps.ensure_backend.outputs.storage_key }}
-        run: |
-          set -euo pipefail
-          EXISTS=$(az storage blob exists \
-            --account-name "${BACKEND_SA}" \
-            --account-key "${STORAGE_KEY}" \
-            --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}" --query exists -o tsv)
-          if [ "${EXISTS}" != "true" ]; then
-            terraform state pull > "${{ inputs.environment }}.tfstate"
-            az storage blob upload \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" \
-              --container-name "${BACKEND_CONTAINER}" \
-              --name "${BACKEND_KEY}" \
-              --file "${{ inputs.environment }}.tfstate" \
-              --overwrite true >/dev/null
-            echo "Created backend state at ${BACKEND_KEY}"
-          else
-            echo "Backend state exists at ${BACKEND_KEY}"
-          fi
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # ALWAYS collect a state snapshot (best-effort), even if Terraform failed
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Collect Terraform state snapshot (always)
+      # ------------------------------- Diagnostics (no uploads) -------------------------------
+      - name: Show backend state (resource list)
         if: ${{ always() }}
         run: |
           set -euo pipefail
-          SNAP="snapshot.tfstate"
-          terraform state pull > "$SNAP" 2>/dev/null || true
-          if [ ! -s "$SNAP" ] && [ -f ".terraform/terraform.tfstate" ]; then
-            cp .terraform/terraform.tfstate "$SNAP"
-          fi
-          if [ ! -s "$SNAP" ]; then
-            echo '{}' > "$SNAP"
-          fi
-          {
-            echo "{"
-            echo "  \"job_status\": \"${{ job.status }}\","
-            echo "  \"tf_action\": \"${{ inputs.tf_action }}\","
-            echo "  \"environment\": \"${{ inputs.environment }}\","
-            echo "  \"timestamp_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-            echo "}"
-          } > snapshot.meta.json
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # ALWAYS upload the snapshot to THE SAME BACKEND KEY
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Upload state snapshot to backend (always to same key)
-        if: ${{ always() }}
-        env:
-          BACKEND_RG:        ${{ env.BACKEND_RG }}
-          BACKEND_SA:        ${{ env.BACKEND_SA }}
-          BACKEND_CONTAINER: ${{ env.BACKEND_CONTAINER }}
-          BACKEND_KEY:       ${{ env.BACKEND_KEY }}
-        run: |
-          set -euo pipefail
-          az group create -n "${BACKEND_RG}" -l "${BACKEND_LOCATION}" >/dev/null || true
-          if ! az storage account show -n "${BACKEND_SA}" -g "${BACKEND_RG}" >/dev/null 2>&1; then
-            az storage account create \
-              -n "${BACKEND_SA}" -g "${BACKEND_RG}" -l "${BACKEND_LOCATION}" \
-              --sku Standard_LRS --kind StorageV2 --allow-blob-public-access false --min-tls-version TLS1_2 >/dev/null
-          fi
-          STORAGE_KEY=$(az storage account keys list -g "${BACKEND_RG}" -n "${BACKEND_SA}" --query "[0].value" -o tsv)
-          if ! az storage container show \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" >/dev/null 2>&1; then
-            az storage container create \
-              --name "${BACKEND_CONTAINER}" \
-              --account-name "${BACKEND_SA}" \
-              --account-key "${STORAGE_KEY}" >/dev/null
-          fi
-          az storage blob upload \
-            --account-name "${BACKEND_SA}" \
-            --account-key "${STORAGE_KEY}" \
-            --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}" \
-            --file snapshot.tfstate \
-            --overwrite true >/dev/null
-          az storage blob upload \
-            --account-name "${BACKEND_SA}" \
-            --account-key "${STORAGE_KEY}" \
-            --container-name "${BACKEND_CONTAINER}" \
-            --name "${BACKEND_KEY}.meta.json" \
-            --file snapshot.meta.json \
-            --overwrite true >/dev/null || true
+          echo "Primary state blob key: ${BACKEND_KEY}"
+          terraform state list || echo "(state empty or unreadable)"
