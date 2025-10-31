@@ -45,12 +45,12 @@ subnets = {
 # Compute
 vm = {
   count              = 2
-  size               = "Standard_B2s"
+  size               = "Standard_B1s"
   admin_username     = "azureuser"
   ssh_public_key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCexampleReplaceWithYourKey"
   subnet_key         = "app"
   public_ip          = true
-  data_disk_sizes_gb = [32]
+  data_disk_sizes_gb = [16]
   role_suffix        = "app"
 }
 
